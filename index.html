@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#1b1d21">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Crono Conv">
+<link rel="manifest" href="manifest.json">
+<title>Cronómetro de conversación</title>
+<style>
+  :root { --rojo:#e53935; --verde:#43a047; --rojo-d:#6e2a28; --verde-d:#285a2c; --bg:#1b1d21; --panel:#262a30; --fg:#e8eaed; --gris:#8a8f98; --carril:#2d3138; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--fg); font-family:"Segoe UI",system-ui,sans-serif; overflow:hidden; }
+  body { display:flex; flex-direction:column; padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom) 12px; }
+  .top { display:flex; align-items:center; justify-content:space-between; padding:8px 0; gap:8px; }
+  .state { font-size:14px; font-weight:700; }
+  .btns-top { display:flex; gap:6px; }
+  .btns-top button { background:var(--panel); color:var(--fg); border:0; border-radius:8px; padding:6px 10px; font-size:12px; }
+  .mainbtns { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:8px 0; }
+  .mainbtns button { color:#fff; border:0; border-radius:12px; padding:18px 8px; font-size:18px; font-weight:800; transition:transform .08s, filter .1s; }
+  .mainbtns button:active { transform:scale(.97); filter:brightness(1.15); }
+  .btn-r { background:var(--rojo); }
+  .btn-r.dim { background:var(--rojo-d); }
+  .btn-v { background:var(--verde); }
+  .btn-v.dim { background:var(--verde-d); }
+  canvas { width:100%; height:90px; background:transparent; border-radius:8px; }
+  .hover { font-size:11px; color:var(--gris); min-height:16px; padding:4px 0; }
+  .tot { display:grid; grid-template-columns:1fr 1fr 1fr; gap:4px; margin:6px 0; }
+  .tot div { font-size:15px; font-weight:700; }
+  .tot .r { color:var(--rojo); text-align:left; }
+  .tot .t { color:var(--fg); text-align:center; font-size:13px; }
+  .tot .v { color:var(--verde); text-align:right; }
+  .list { flex:1; overflow:auto; background:var(--panel); border-radius:10px; padding:8px; font-family:Consolas,monospace; font-size:12px; }
+  .list .r { color:var(--rojo); }
+  .list .v { color:var(--verde); }
+  .list .m { color:var(--gris); }
+  .foot { font-size:10px; color:var(--gris); text-align:center; padding:6px 0; }
+  .alpha { display:flex; align-items:center; gap:6px; }
+  .alpha input { width:80px; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <span class="state" id="state">Listo</span>
+    <div class="btns-top">
+      <button id="btnPause">Pausa</button>
+      <button id="btnReset">Reset</button>
+      <button id="btnExport">Exportar</button>
+    </div>
+  </div>
+  <div class="mainbtns">
+    <button id="btnR" class="btn-r">YO  (tap)</button>
+    <button id="btnV" class="btn-v">OTRO  (tap)</button>
+  </div>
+  <canvas id="cv"></canvas>
+  <div class="hover" id="hover">Pasa el dedo por la barra para ver el detalle de cada par</div>
+  <div class="tot">
+    <div class="r" id="tr">YO  00:00  0%</div>
+    <div class="t" id="tt">00:00 / 60:00</div>
+    <div class="v" id="tv">0%  00:00  OTRO</div>
+  </div>
+  <div class="list" id="list"></div>
+  <div class="foot">Tap YO / OTRO para cambiar turno · Pausa · Reset · Exportar guarda CSV</div>
+
+<script>
+const DURACION = 3600;
+let seg = [], total = 0, running = false, finished = false, last = 0;
+let wakeLock = null;
+
+function now(){ return performance.now()/1000; }
+function fmt(s){ s=Math.floor(s); const h=Math.floor(s/3600); const m=Math.floor((s%3600)/60); const sec=s%60; return h?`${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`; }
+function pcts(r,v){ const s=r+v; if(s<=0) return [0,0]; const a=Math.round(100*r/s); return [a,100-a]; }
+function totales(){ let r=0,v=0; for(const s of seg){ const d=s[2]-s[1]; if(s[0]==='R') r+=d; else v+=d; } return [r,v]; }
+function pairs(){ const res=[]; const n=seg.length; for(let k=0;k<n;k+=2){ const a=seg[k]; const b=(k+1<n)?seg[k+1]:null; const t={R:0,V:0}; t[a[0]]+=a[2]-a[1]; if(b) t[b[0]]+=b[2]-b[1]; res.push({n:k/2+1,t0:a[1],t1:b?b[2]:a[2],r:t.R,v:t.V,closed:(k+2<n)||finished}); } return res; }
+
+function advance(t){
+  let fin=false;
+  if(running){
+    total += t-last;
+    if(total>=DURACION){ total=DURACION; running=false; finished=true; fin=true; }
+    if(seg.length) seg[seg.length-1][2]=total;
+  }
+  last=t;
+  return fin;
+}
+function switchWho(who){
+  if(finished) return;
+  const t=now();
+  advance(t);
+  if(finished) return;
+  if(running){
+    if(seg[seg.length-1][0]===who) return;
+    seg.push([who,total,total]);
+  } else {
+    last=t;
+    if(!(seg.length && seg[seg.length-1][0]===who)) seg.push([who,total,total]);
+    running=true;
+  }
+  try{ navigator.vibrate && navigator.vibrate(30); }catch(e){}
+  refresh();
+}
+function pause(){
+  if(finished||!seg.length) return;
+  const t=now();
+  advance(t);
+  running=false;
+  refresh();
+}
+function toggle(){
+  if(finished) return;
+  if(!seg.length) switchWho('R');
+  else switchWho(seg[seg.length-1][0]==='R'?'V':'R');
+}
+function reset(){
+  if(seg.length && !finished && !confirm('Reiniciar y borrar la medición actual?')) return;
+  seg=[]; total=0; running=false; finished=false; last=0;
+  try{ localStorage.removeItem('crono'); }catch(e){}
+  refresh();
+}
+
+function save(){ try{ localStorage.setItem('crono', JSON.stringify({seg,total,running,finished,last:now()})); }catch(e){} }
+
+function exportCSV(){
+  const [r,v]=totales(); const [a,b]=pcts(r,v);
+  let csv='Par,t0,t1,YO,OTRO,Total,cerrado\n';
+  for(const p of pairs()) csv+=`${p.n},${fmt(p.t0)},${fmt(p.t1)},${fmt(p.r)},${fmt(p.v)},${fmt(p.r+p.v)},${p.closed}\n`;
+  csv+=`\nTotal,${fmt(total)},,${fmt(r)} (${a}%),${fmt(v)} (${b}%),${fmt(r+v)},\n`;
+  const blob=new Blob([csv],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const link=document.createElement('a'); link.href=url; link.download='crono_conversacion.csv'; link.click();
+  URL.revokeObjectURL(url);
+}
+
+function draw(){
+  const c=document.getElementById('cv'); const ctx=c.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  const w=c.clientWidth; const h=c.clientHeight;
+  c.width=w*dpr; c.height=h*dpr; ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,w,h);
+  const x0=12, x1=w-12, k=(x1-x0)/DURACION;
+  // ticks
+  ctx.fillStyle='#8a8f98'; ctx.font='9px system-ui';
+  for(let mn=0;mn<=60;mn+=10){ const x=x0+mn*60*k; ctx.fillRect(x,14,1,5); ctx.fillText(mn+'m', x, 10); }
+  ctx.fillStyle='#2d3138';
+  ctx.fillRect(x0,22,x1-x0,20); ctx.fillRect(x0,48,x1-x0,20);
+  let prev=null;
+  for(const s of seg){ const xa=x0+s[1]*k; const xb=Math.max(x0+s[2]*k, xa+1); const [y0,y1]=s[0]==='R'?[22,42]:[48,68]; ctx.fillStyle=s[0]==='R'?'#e53935':'#43a047'; ctx.fillRect(xa,y0,xb-xa,y1-y0); if(prev!==null){ ctx.strokeStyle='#8a8f98'; ctx.beginPath(); ctx.moveTo(xa,42); ctx.lineTo(xa,48); ctx.stroke(); } prev=s[0]; }
+  // pair labels
+  const last=[-1e9,-1e9];
+  for(const p of pairs()){
+    if(!p.closed) continue;
+    const xa=x0+p.t0*k, xb=x0+p.t1*k;
+    ctx.strokeStyle='#8a8f98'; ctx.beginPath(); ctx.moveTo(xb,70); ctx.lineTo(xb,78); ctx.stroke();
+    const [a,b]=pcts(p.r,p.v); const ta=a+'%', tb=b+'%';
+    const ancho=(ta.length+tb.length)*5.4+10; const mid=(xa+xb)/2;
+    const fila=p.n%2;
+    if(mid-ancho/2>last[fila]+3 && mid+ancho/2<x1+8){
+      const y=88+fila*12; ctx.font='bold 9px system-ui';
+      ctx.fillStyle='#e53935'; ctx.textAlign='right'; ctx.fillText(ta,mid-2,y);
+      ctx.fillStyle='#8a8f98'; ctx.textAlign='center'; ctx.fillText('|',mid,y);
+      ctx.fillStyle='#43a047'; ctx.textAlign='left'; ctx.fillText(tb,mid+2,y);
+      last[fila]=mid+ancho/2;
+    }
+  }
+}
+
+function fillList(){
+  const el=document.getElementById('list'); const ps=pairs();
+  let html='';
+  for(const p of ps){
+    const [a,b]=pcts(p.r,p.v);
+    html+=`<div><span class="m">Par ${String(p.n).padStart(2,' ')}  ${fmt(p.t0)}-${fmt(p.t1)}   </span><span class="r">YO ${fmt(p.r)} ${String(a).padStart(3,' ')}%</span><span class="m">   </span><span class="v">OTRO ${fmt(p.v)} ${String(b).padStart(3,' ')}%</span><span class="m">   S ${fmt(p.r+p.v)}${p.closed?'':'  ...'}</span></div>`;
+  }
+  el.innerHTML=html||'<span class="m">Sin mediciones aún</span>';
+}
+
+function refresh(){
+  const m={seg,total,running,finished};
+  let st='Listo';
+  if(finished) st='Finalizado'; else if(running) st='Hablando: '+(seg[seg.length-1][0]==='R'?'YO':'OTRO'); else if(seg.length) st='En pausa';
+  document.getElementById('state').textContent=st;
+  const quien=running?(seg[seg.length-1][0]):null;
+  const btnR=document.getElementById('btnR'); const btnV=document.getElementById('btnV');
+  btnR.className='btn-r'+(quien!==null && quien!=='R'?' dim':'');
+  btnV.className='btn-v'+(quien!==null && quien!=='V'?' dim':'');
+  document.getElementById('btnPause').textContent=(seg.length && !running && !finished)?'Seguir':'Pausa';
+  const [r,v]=totales(); const [a,b]=pcts(r,v);
+  document.getElementById('tr').textContent=`YO  ${fmt(r)}  ${a}%`;
+  document.getElementById('tv').textContent=`${b}%  ${fmt(v)}  OTRO`;
+  document.getElementById('tt').textContent=`${fmt(total)} / ${fmt(DURACION)}`;
+  draw(); fillList();
+  if(finished){ try{ navigator.vibrate && navigator.vibrate([200,100,200]); }catch(e){} }
+}
+
+function tick(){
+  if(advance(now())) setTimeout(onFinish,50);
+  refresh(); save();
+  setTimeout(tick,100);
+}
+function onFinish(){
+  const [r,v]=totales(); const [a,b]=pcts(r,v);
+  alert(`Fin de la hora\n\nTiempo total: ${fmt(total)}\n\nYO:    ${fmt(r)}   (${a}%)\nOTRO:  ${fmt(v)}   (${b}%)`);
+}
+
+// wake lock
+async function requestWakeLock(){ try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){} }
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') requestWakeLock(); });
+
+// hover por toque en canvas
+const cv=document.getElementById('cv');
+cv.addEventListener('touchmove',e=>{ e.preventDefault(); const t=e.touches[0]; handleHover(t.clientX); }, {passive:false});
+cv.addEventListener('mousemove',e=>handleHover(e.clientX));
+function handleHover(cx){
+  const rect=cv.getBoundingClientRect(); const x=cx-rect.left; const x0=12; const k=(rect.width-24)/DURACION;
+  const tt=(x-x0)/k;
+  if(tt<0||tt>total){ document.getElementById('hover').textContent='Pasa el dedo por la barra para ver el detalle de cada par'; return; }
+  for(const p of pairs()){ if(p.t0<=tt && tt<=p.t1+1e-6){ const [a,b]=pcts(p.r,p.v); document.getElementById('hover').textContent=`${fmt(tt)}  Par ${p.n}:  YO ${fmt(p.r)} (${a}%)  OTRO ${fmt(p.v)} (${b}%)`; return; } }
+  document.getElementById('hover').textContent='Pasa el dedo por la barra para ver el detalle de cada par';
+}
+
+// init
+document.getElementById('btnR').addEventListener('click',()=>switchWho('R'));
+document.getElementById('btnV').addEventListener('click',()=>switchWho('V'));
+document.getElementById('btnPause').addEventListener('click',pause);
+document.getElementById('btnReset').addEventListener('click',reset);
+document.getElementById('btnExport').addEventListener('click',exportCSV);
+
+// restore
+try{ const d=JSON.parse(localStorage.getItem('crono')||'null'); if(d){ seg=d.seg; total=d.total; running=d.running; finished=d.finished; last=now(); } }catch(e){}
+requestWakeLock();
+refresh();
+tick();
+</script>
+</body>
+</html>
